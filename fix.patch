@@ -1,0 +1,314 @@
+diff --git a/pkg/sessionctx/variable/session.go b/pkg/sessionctx/variable/session.go
+--- a/pkg/sessionctx/variable/session.go
++++ b/pkg/sessionctx/variable/session.go
+@@ -814,6 +814,13 @@
+ 	*UserVars
+ 	// systems variables, don't modify it directly, use GetSystemVar/SetSystemVar method.
+ 	systems map[string]string
++	// systemsMu protects systems. The read path GetSessionOrGlobalSystemVar
++	// lazily populates systems, and the branches of a UNION (or a parallel
++	// projection) run that path concurrently on the same SessionVars, which
++	// otherwise triggers a Go "concurrent map read and map write" fatal (#73702).
++	// Every access to systems must hold this lock; keep the critical sections
++	// short and never call another systems-accessing function while holding it.
++	systemsMu sync.RWMutex
+ 	// SysWarningCount is the system variable "warning_count", because it is on the hot path, so we extract it from the systems
+ 	SysWarningCount int
+ 	// SysErrorCount is the system variable "error_count", because it is on the hot path, so we extract it from the systems
+@@ -2601,7 +2608,9 @@
+ 	if vardef.EnableRowLevelChecksum.Load() {
+ 		vars.EnableRowLevelChecksum = true
+ 	}
++	vars.systemsMu.Lock()
+ 	vars.systems[vardef.CharacterSetConnection], vars.systems[vardef.CollationConnection] = charset.GetDefaultCharsetAndCollate()
++	vars.systemsMu.Unlock()
+ 	return vars
+ }
+ 
+@@ -2760,8 +2769,10 @@
+ // have their own collation, which has a higher collation precedence.
+ // See https://dev.mysql.com/doc/refman/5.7/en/charset-connection.html
+ func (s *SessionVars) GetCharsetInfo() (charset, collation string) {
++	s.systemsMu.RLock()
+ 	charset = s.systems[vardef.CharacterSetConnection]
+ 	collation = s.systems[vardef.CollationConnection]
++	s.systemsMu.RUnlock()
+ 	return
+ }
+ 
+@@ -2931,7 +2942,9 @@
+ 	} else if name == vardef.ErrorCount {
+ 		return strconv.Itoa(int(s.SysErrorCount)), true
+ 	}
++	s.systemsMu.RLock()
+ 	val, ok := s.systems[name]
++	s.systemsMu.RUnlock()
+ 	return val, ok
+ }
+ 
+@@ -3057,13 +3070,20 @@
+ 			// shortcut to the getter, we won't use the value
+ 			return sv.GetSessionFromHook(s)
+ 		}
+-		if _, ok := s.systems[sv.Name]; !ok {
++		s.systemsMu.RLock()
++		_, ok := s.systems[sv.Name]
++		s.systemsMu.RUnlock()
++		if !ok {
+ 			if sv.HasGlobalScope() {
+ 				if val, err := s.GlobalVarsAccessor.GetGlobalSysVar(sv.Name); err == nil {
++					s.systemsMu.Lock()
+ 					s.systems[sv.Name] = val
++					s.systemsMu.Unlock()
+ 				}
+ 			} else {
++				s.systemsMu.Lock()
+ 				s.systems[sv.Name] = sv.Value // no global scope, use default
++				s.systemsMu.Unlock()
+ 			}
+ 		}
+ 		return sv.GetSessionFromHook(s)
+@@ -3088,7 +3108,10 @@
+ 		return val, err == nil, err
+ 	}
+ 	// Only get the cached value. No need to check the global or default value.
+-	if val, ok := s.systems[sv.Name]; ok {
++	s.systemsMu.RLock()
++	val, ok := s.systems[sv.Name]
++	s.systemsMu.RUnlock()
++	if ok {
+ 		return val, true, nil
+ 	}
+ 	return "", false, nil
+@@ -3101,7 +3124,10 @@
+ 		return "", false, nil
+ 	}
+ 	// Preserve the client's spelling when it still denotes the effective timestamp.
+-	if value, ok := s.systems[vardef.TiDBSnapshot]; ok {
++	s.systemsMu.RLock()
++	value, ok := s.systems[vardef.TiDBSnapshot]
++	s.systemsMu.RUnlock()
++	if ok {
+ 		if ts, err := parseTSFromNumberOrTime(s, value); err == nil && ts == s.SnapshotTS {
+ 			return value, true, nil
+ 		}
+diff --git a/pkg/sessionctx/variable/sysvar.go b/pkg/sessionctx/variable/sysvar.go
+--- a/pkg/sessionctx/variable/sysvar.go
++++ b/pkg/sessionctx/variable/sysvar.go
+@@ -173,7 +173,10 @@
+ }
+ 
+ func getForeignKeyCheckInSharedLockSession(s *SessionVars) (string, error) {
+-	if val, ok := s.systems[vardef.TiDBForeignKeyCheckInSharedLock]; ok {
++	s.systemsMu.RLock()
++	val, ok := s.systems[vardef.TiDBForeignKeyCheckInSharedLock]
++	s.systemsMu.RUnlock()
++	if ok {
+ 		return val, nil
+ 	}
+ 	if s.GlobalVarsAccessor != nil {
+@@ -210,13 +213,18 @@
+ 
+ 	/* The system variables below have SESSION scope  */
+ 	{Scope: vardef.ScopeSession, Name: vardef.Timestamp, Value: vardef.DefTimestamp, MinValue: 0, MaxValue: math.MaxInt32, Type: vardef.TypeFloat, GetSession: func(s *SessionVars) (string, error) {
+-		if timestamp, ok := s.systems[vardef.Timestamp]; ok && timestamp != vardef.DefTimestamp {
++		s.systemsMu.RLock()
++		timestamp, ok := s.systems[vardef.Timestamp]
++		s.systemsMu.RUnlock()
++		if ok && timestamp != vardef.DefTimestamp {
+ 			return timestamp, nil
+ 		}
+ 		timestamp := s.StmtCtx.GetOrStoreStmtCache(stmtctx.StmtNowTsCacheKey, time.Now()).(time.Time)
+ 		return types.ToString(float64(timestamp.UnixNano()) / float64(time.Second))
+ 	}, GetStateValue: func(s *SessionVars) (string, bool, error) {
++		s.systemsMu.RLock()
+ 		timestamp, ok := s.systems[vardef.Timestamp]
++		s.systemsMu.RUnlock()
+ 		return timestamp, ok && timestamp != vardef.DefTimestamp, nil
+ 	}, Validation: func(vars *SessionVars, normalizedValue string, originalValue string, scope vardef.ScopeFlag) (string, error) {
+ 		val := tidbOptFloat64(originalValue, vardef.DefTimestampFloat)
+@@ -2088,7 +2096,9 @@
+ 		return checkCollation(vars, normalizedValue, originalValue, scope)
+ 	}, SetSession: func(s *SessionVars, val string) error {
+ 		if coll, err := collate.GetCollationByName(val); err == nil {
++			s.systemsMu.Lock()
+ 			s.systems[vardef.CharacterSetServer] = coll.CharsetName
++			s.systemsMu.Unlock()
+ 		}
+ 		return nil
+ 	}},
+@@ -2161,7 +2171,9 @@
+ 		return checkCollation(vars, normalizedValue, originalValue, scope)
+ 	}, SetSession: func(s *SessionVars, val string) error {
+ 		if coll, err := collate.GetCollationByName(val); err == nil {
++			s.systemsMu.Lock()
+ 			s.systems[vardef.CharsetDatabase] = coll.CharsetName
++			s.systemsMu.Unlock()
+ 		}
+ 		return nil
+ 	}},
+@@ -2197,7 +2209,9 @@
+ 		return checkCollation(vars, normalizedValue, originalValue, scope)
+ 	}, SetSession: func(s *SessionVars, val string) error {
+ 		if coll, err := collate.GetCollationByName(val); err == nil {
++			s.systemsMu.Lock()
+ 			s.systems[vardef.CharacterSetConnection] = coll.CharsetName
++			s.systemsMu.Unlock()
+ 		}
+ 		return nil
+ 	}},
+@@ -2214,7 +2228,9 @@
+ 		return checkCharacterSet(normalizedValue, vardef.CharsetDatabase)
+ 	}, SetSession: func(s *SessionVars, val string) error {
+ 		if cs, err := charset.GetCharsetInfo(val); err == nil {
++			s.systemsMu.Lock()
+ 			s.systems[vardef.CollationDatabase] = cs.DefaultCollation
++			s.systemsMu.Unlock()
+ 		}
+ 		return nil
+ 	}},
+@@ -2265,7 +2281,9 @@
+ 		return checkCharacterSet(normalizedValue, vardef.CharacterSetConnection)
+ 	}, SetSession: func(s *SessionVars, val string) error {
+ 		if cs, err := charset.GetCharsetInfo(val); err == nil {
++			s.systemsMu.Lock()
+ 			s.systems[vardef.CollationConnection] = cs.DefaultCollation
++			s.systemsMu.Unlock()
+ 		}
+ 		return nil
+ 	}},
+@@ -2273,7 +2291,9 @@
+ 		return checkCharacterSet(normalizedValue, vardef.CharacterSetServer)
+ 	}, SetSession: func(s *SessionVars, val string) error {
+ 		if cs, err := charset.GetCharsetInfo(val); err == nil {
++			s.systemsMu.Lock()
+ 			s.systems[vardef.CollationServer] = cs.DefaultCollation
++			s.systemsMu.Unlock()
+ 		}
+ 		return nil
+ 	}},
+diff --git a/pkg/sessionctx/variable/variable.go b/pkg/sessionctx/variable/variable.go
+--- a/pkg/sessionctx/variable/variable.go
++++ b/pkg/sessionctx/variable/variable.go
+@@ -408,7 +408,10 @@
+ 		ok  bool
+ 		val string
+ 	)
+-	if val, ok = s.systems[sv.Name]; !ok {
++	s.systemsMu.RLock()
++	val, ok = s.systems[sv.Name]
++	s.systemsMu.RUnlock()
++	if !ok {
+ 		return val, errors.New("sysvar has not yet loaded")
+ 	}
+ 	return val, nil
+@@ -421,7 +424,9 @@
+ 			return err
+ 		}
+ 	}
++	s.systemsMu.Lock()
+ 	s.systems[sv.Name] = val
++	s.systemsMu.Unlock()
+ 
+ 	// Call the Set function on all the aliases for this sysVar
+ 	// Skipping the validation function, and not calling aliases of
+@@ -436,7 +441,9 @@
+ 					return err
+ 				}
+ 			}
++			s.systemsMu.Lock()
+ 			s.systems[aliasSv.Name] = val
++			s.systemsMu.Unlock()
+ 		}
+ 	}
+ 	return nil
+diff --git a/pkg/sessionctx/variable/varsutil.go b/pkg/sessionctx/variable/varsutil.go
+--- a/pkg/sessionctx/variable/varsutil.go
++++ b/pkg/sessionctx/variable/varsutil.go
+@@ -116,7 +116,10 @@
+ func checkIsolationLevel(vars *SessionVars, normalizedValue string, originalValue string, scope vardef.ScopeFlag) (string, error) {
+ 	if normalizedValue == "SERIALIZABLE" || normalizedValue == "READ-UNCOMMITTED" {
+ 		returnErr := ErrUnsupportedIsolationLevel.FastGenByArgs(normalizedValue)
+-		if !TiDBOptOn(vars.systems[vardef.TiDBSkipIsolationLevelCheck]) {
++		vars.systemsMu.RLock()
++		skipIsolationLevelCheck := vars.systems[vardef.TiDBSkipIsolationLevelCheck]
++		vars.systemsMu.RUnlock()
++		if !TiDBOptOn(skipIsolationLevelCheck) {
+ 			return normalizedValue, ErrUnsupportedIsolationLevel.GenWithStackByArgs(normalizedValue)
+ 		}
+ 		vars.StmtCtx.AppendWarning(returnErr)
+diff --git a/pkg/sessionctx/variable/session_systems_concurrent_test.go b/pkg/sessionctx/variable/session_systems_concurrent_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/sessionctx/variable/session_systems_concurrent_test.go
+@@ -0,0 +1,70 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package variable
++
++import (
++	"context"
++	"sync"
++	"testing"
++)
++
++// TestGetSessionOrGlobalSystemVarConcurrent reproduces issue #73702: the branches
++// of a UNION (or a parallel projection) read information_schema.variables_info in
++// separate goroutines that share the same SessionVars. setDataForVariablesInfo
++// calls GetSessionOrGlobalSystemVar for every system variable, and for a
++// session-scoped variable that is not yet cached that function lazily writes
++// s.systems. Without synchronization the concurrent goroutines trigger a Go
++// "concurrent map read and map write" / "concurrent map writes" fatal that kills
++// the whole tidb-server process.
++//
++// Run with -race: before the fix the race detector reports a data race on
++// SessionVars.systems; after the fix (systemsMu) it is clean.
++func TestGetSessionOrGlobalSystemVarConcurrent(t *testing.T) {
++	// Collect the session-scoped variables that take the lazy-population path
++	// (no GetSession hook), i.e. exactly the ones that write s.systems on first
++	// read. This mirrors what setDataForVariablesInfo iterates over.
++	var names []string
++	for _, sv := range GetSysVars() {
++		if sv.HasSessionScope() && sv.GetSession == nil {
++			names = append(names, sv.Name)
++		}
++	}
++	if len(names) == 0 {
++		t.Skip("no session-scoped variables without a GetSession hook")
++	}
++
++	const branches = 8
++	for iter := 0; iter < 20; iter++ {
++		// A fresh session whose systems map is not yet populated, like a new
++		// connection running the UNION as its first statement.
++		vars := NewSessionVars(nil)
++		vars.GlobalVarsAccessor = NewMockGlobalAccessor()
++
++		var wg sync.WaitGroup
++		start := make(chan struct{})
++		for b := 0; b < branches; b++ {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				<-start
++				for _, name := range names {
++					_, _ = vars.GetSessionOrGlobalSystemVar(context.Background(), name)
++				}
++			}()
++		}
++		close(start)
++		wg.Wait()
++	}
++}
