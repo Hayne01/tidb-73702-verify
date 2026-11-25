@@ -112,11 +112,12 @@ diff --git a/pkg/sessionctx/variable/sysvar.go b/pkg/sessionctx/variable/sysvar.
  	/* The system variables below have SESSION scope  */
  	{Scope: vardef.ScopeSession, Name: vardef.Timestamp, Value: vardef.DefTimestamp, MinValue: 0, MaxValue: math.MaxInt32, Type: vardef.TypeFloat, GetSession: func(s *SessionVars) (string, error) {
 -		if timestamp, ok := s.systems[vardef.Timestamp]; ok && timestamp != vardef.DefTimestamp {
+-			return timestamp, nil
 +		s.systemsMu.RLock()
-+		timestamp, ok := s.systems[vardef.Timestamp]
++		tsVal, ok := s.systems[vardef.Timestamp]
 +		s.systemsMu.RUnlock()
-+		if ok && timestamp != vardef.DefTimestamp {
- 			return timestamp, nil
++		if ok && tsVal != vardef.DefTimestamp {
++			return tsVal, nil
  		}
  		timestamp := s.StmtCtx.GetOrStoreStmtCache(stmtctx.StmtNowTsCacheKey, time.Now()).(time.Time)
  		return types.ToString(float64(timestamp.UnixNano()) / float64(time.Second))
