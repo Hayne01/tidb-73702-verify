@@ -79,16 +79,15 @@ jobs:
       run: |
         set -uo pipefail
         cd "${SRC_DIR}"
-        go test -count=1 -timeout 600s -skip TestGetSessionOrGlobalSystemVarConcurrent ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/pkg_baseline.log" 2>&1
-        echo "baseline_exit=$?" | tee -a "${RESULTS_DIR}/pkg_baseline.log"
+        go test -count=1 -timeout 600s -skip TestGetSessionOrGlobalSystemVarConcurrent ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/pkg_baseline.log" 2>&1 && rc=0 || rc=$?
+        echo "baseline_exit=${rc}" | tee -a "${RESULTS_DIR}/pkg_baseline.log"
         tail -n 20 "${RESULTS_DIR}/pkg_baseline.log" || true
 
     - name: BEFORE fix - race reproducer (expect DATA RACE / FAIL)
       run: |
         set -uo pipefail
         cd "${SRC_DIR}"
-        go test -race -run TestGetSessionOrGlobalSystemVarConcurrent -count=1 ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/race_before.log" 2>&1
-        rc=$?
+        go test -race -run TestGetSessionOrGlobalSystemVarConcurrent -count=1 ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/race_before.log" 2>&1 && rc=0 || rc=$?
         echo "race_before_exit=${rc}" | tee -a "${RESULTS_DIR}/race_before.log"
         echo "=== race_before tail ==="; tail -n 40 "${RESULTS_DIR}/race_before.log" || true
         if [ "${rc}" -eq 0 ]; then
@@ -130,8 +129,7 @@ jobs:
       run: |
         set -uo pipefail
         cd "${SRC_DIR}"
-        go test -race -run TestGetSessionOrGlobalSystemVarConcurrent -count=1 ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/race_after.log" 2>&1
-        rc=$?
+        go test -race -run TestGetSessionOrGlobalSystemVarConcurrent -count=1 ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/race_after.log" 2>&1 && rc=0 || rc=$?
         echo "race_after_exit=${rc}" | tee -a "${RESULTS_DIR}/race_after.log"
         echo "=== race_after tail ==="; tail -n 25 "${RESULTS_DIR}/race_after.log" || true
         if [ "${rc}" -eq 0 ] && ! grep -q "DATA RACE" "${RESULTS_DIR}/race_after.log"; then
@@ -144,8 +142,8 @@ jobs:
       run: |
         set -uo pipefail
         cd "${SRC_DIR}"
-        go test -count=1 -timeout 600s -skip TestGetSessionOrGlobalSystemVarConcurrent ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/pkg_patched.log" 2>&1
-        echo "patched_exit=$?" | tee -a "${RESULTS_DIR}/pkg_patched.log"
+        go test -count=1 -timeout 600s -skip TestGetSessionOrGlobalSystemVarConcurrent ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/pkg_patched.log" 2>&1 && rc=0 || rc=$?
+        echo "patched_exit=${rc}" | tee -a "${RESULTS_DIR}/pkg_patched.log"
         tail -n 20 "${RESULTS_DIR}/pkg_patched.log" || true
 
     - name: Build tidb-server AFTER fix (incremental)
