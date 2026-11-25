@@ -1,0 +1,227 @@
+name: Verify tidb#73702 (concurrent map fatal on variables_info UNION)
+
+# Scratch runtime verification ONLY. Builds pingcap/tidb@master, reproduces the
+# concurrent SessionVars.systems access BEFORE the fix (go test -race data race
+# + real tidb-server UNION crash), applies the fix, and shows it is gone AFTER.
+# Never commits to or opens a PR against pingcap/tidb.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-73702-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+    - name: Free Disk Space
+      run: |
+        df -h /
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+        df -h /
+
+    - name: Checkout pingcap/tidb (master)
+      uses: actions/checkout@v4
+      with:
+        repository: pingcap/tidb
+        ref: master
+        path: tidb
+        fetch-depth: 1
+
+    - name: Checkout verification tools (this repo)
+      uses: actions/checkout@v4
+      with:
+        path: tools
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: tidb/go.mod
+        cache-dependency-path: tidb/go.sum
+
+    - name: Resolve parameters
+      run: |
+        set -euo pipefail
+        sha=$(git -C tidb rev-parse HEAD)
+        {
+          echo "SRC_DIR=${GITHUB_WORKSPACE}/tidb"
+          echo "TOOLS_DIR=${GITHUB_WORKSPACE}/tools"
+          echo "RESULTS_DIR=${GITHUB_WORKSPACE}/results"
+          echo "TIDB_SHA=${sha}"
+          echo "GOFLAGS=-p=2"
+        } | tee -a "$GITHUB_ENV"
+        mkdir -p "${GITHUB_WORKSPACE}/results"
+        echo "tidb master commit: ${sha}"
+        printf '%s\n' "${sha}" > "${GITHUB_WORKSPACE}/tidb-sha.txt"
+        go version
+
+    - name: Download modules
+      run: |
+        set -eo pipefail
+        cd "${SRC_DIR}" && go mod download
+
+    - name: Add #73702 regression test (test-only, no code fix yet)
+      run: |
+        set -eo pipefail
+        cd "${SRC_DIR}"
+        git apply --verbose --include='pkg/sessionctx/variable/session_systems_concurrent_test.go' "${TOOLS_DIR}/fix.patch"
+        ls -l pkg/sessionctx/variable/session_systems_concurrent_test.go
+
+    - name: BEFORE fix - existing variable package baseline (skip new test)
+      run: |
+        set -uo pipefail
+        cd "${SRC_DIR}"
+        go test -count=1 -timeout 600s -skip TestGetSessionOrGlobalSystemVarConcurrent ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/pkg_baseline.log" 2>&1
+        echo "baseline_exit=$?" | tee -a "${RESULTS_DIR}/pkg_baseline.log"
+        tail -n 20 "${RESULTS_DIR}/pkg_baseline.log" || true
+
+    - name: BEFORE fix - race reproducer (expect DATA RACE / FAIL)
+      run: |
+        set -uo pipefail
+        cd "${SRC_DIR}"
+        go test -race -run TestGetSessionOrGlobalSystemVarConcurrent -count=1 ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/race_before.log" 2>&1
+        rc=$?
+        echo "race_before_exit=${rc}" | tee -a "${RESULTS_DIR}/race_before.log"
+        echo "=== race_before tail ==="; tail -n 40 "${RESULTS_DIR}/race_before.log" || true
+        if [ "${rc}" -eq 0 ]; then
+          echo "::error::race reproducer PASSED before fix (expected to fail with a data race)."
+          echo "UNEXPECTED_PASS" > "${RESULTS_DIR}/race_before.verdict"
+        elif grep -q "DATA RACE" "${RESULTS_DIR}/race_before.log"; then
+          echo "RACE_DETECTED_BEFORE" > "${RESULTS_DIR}/race_before.verdict"
+          echo "Confirmed: data race on SessionVars.systems before fix."
+        else
+          echo "FAILED_BEFORE_NO_RACE_TAG" > "${RESULTS_DIR}/race_before.verdict"
+          echo "::warning::race test failed before fix but no DATA RACE tag (may be a concurrent-map fatal)."
+        fi
+
+    - name: Build tidb-server BEFORE fix
+      run: |
+        set -eo pipefail
+        cd "${SRC_DIR}"
+        time go build -o "${RESULTS_DIR}/tidb-server-before" ./cmd/tidb-server
+
+    - name: BEFORE fix - real server UNION smoke (expect process death)
+      run: |
+        set -uo pipefail
+        bash "${TOOLS_DIR}/run-smoke.sh" "${RESULTS_DIR}/tidb-server-before" 4000 "${RESULTS_DIR}/smoke_before" "${SRC_DIR}" | tee "${RESULTS_DIR}/smoke_before.verdict.log"
+        echo "=== before server log tail ==="; tail -n 25 "${RESULTS_DIR}/smoke_before.server.log" || true
+
+    - name: Apply code fix
+      run: |
+        set -eo pipefail
+        cd "${SRC_DIR}"
+        git apply --verbose \
+          --include='pkg/sessionctx/variable/session.go' \
+          --include='pkg/sessionctx/variable/sysvar.go' \
+          --include='pkg/sessionctx/variable/variable.go' \
+          --include='pkg/sessionctx/variable/varsutil.go' \
+          "${TOOLS_DIR}/fix.patch"
+        echo "=== systemsMu now present ==="; grep -c systemsMu pkg/sessionctx/variable/session.go
+
+    - name: AFTER fix - race reproducer (expect PASS, race clean)
+      run: |
+        set -uo pipefail
+        cd "${SRC_DIR}"
+        go test -race -run TestGetSessionOrGlobalSystemVarConcurrent -count=1 ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/race_after.log" 2>&1
+        rc=$?
+        echo "race_after_exit=${rc}" | tee -a "${RESULTS_DIR}/race_after.log"
+        echo "=== race_after tail ==="; tail -n 25 "${RESULTS_DIR}/race_after.log" || true
+        if [ "${rc}" -eq 0 ] && ! grep -q "DATA RACE" "${RESULTS_DIR}/race_after.log"; then
+          echo "RACE_CLEAN_AFTER" > "${RESULTS_DIR}/race_after.verdict"
+        else
+          echo "RACE_STILL_PRESENT" > "${RESULTS_DIR}/race_after.verdict"
+        fi
+
+    - name: AFTER fix - existing variable package (no-regression, skip new test)
+      run: |
+        set -uo pipefail
+        cd "${SRC_DIR}"
+        go test -count=1 -timeout 600s -skip TestGetSessionOrGlobalSystemVarConcurrent ./pkg/sessionctx/variable/ > "${RESULTS_DIR}/pkg_patched.log" 2>&1
+        echo "patched_exit=$?" | tee -a "${RESULTS_DIR}/pkg_patched.log"
+        tail -n 20 "${RESULTS_DIR}/pkg_patched.log" || true
+
+    - name: Build tidb-server AFTER fix (incremental)
+      run: |
+        set -eo pipefail
+        cd "${SRC_DIR}"
+        time go build -o "${RESULTS_DIR}/tidb-server-after" ./cmd/tidb-server
+
+    - name: AFTER fix - real server UNION smoke (expect survival)
+      run: |
+        set -uo pipefail
+        bash "${TOOLS_DIR}/run-smoke.sh" "${RESULTS_DIR}/tidb-server-after" 4001 "${RESULTS_DIR}/smoke_after" "${SRC_DIR}" | tee "${RESULTS_DIR}/smoke_after.verdict.log"
+        echo "=== after server log tail ==="; tail -n 15 "${RESULTS_DIR}/smoke_after.server.log" || true
+
+    - name: Assert before/after contrast and no-regression
+      run: |
+        set -uo pipefail
+        cd "${RESULTS_DIR}"
+        ok=1
+        rb=$(cat race_before.verdict 2>/dev/null || echo MISSING)
+        ra=$(cat race_after.verdict 2>/dev/null || echo MISSING)
+        echo "race_before=${rb} race_after=${ra}"
+        # (1) race reproducer must fail before and pass after.
+        if [ "${rb}" != "RACE_DETECTED_BEFORE" ] && [ "${rb}" != "FAILED_BEFORE_NO_RACE_TAG" ]; then
+          echo "::error::race reproducer did not fail before fix (${rb})."; ok=0
+        fi
+        if [ "${ra}" != "RACE_CLEAN_AFTER" ]; then
+          echo "::error::race reproducer not clean after fix (${ra})."; ok=0
+        fi
+        # (2) real server must die before and survive after.
+        if grep -q SERVER_DEAD smoke_before.verdict.log && grep -q CONCURRENT_MAP_FATAL smoke_before.verdict.log; then
+          echo "server before: DEAD with concurrent-map fatal (reproduced #73702)"
+        else
+          echo "::warning::server before did not show the expected fatal crash (timing-dependent); race test is the deterministic proof."
+        fi
+        if grep -q SERVER_ALIVE smoke_after.verdict.log; then
+          echo "server after: ALIVE (fixed)"
+        else
+          echo "::error::server after fix did not survive the UNION smoke."; ok=0
+        fi
+        # (3) existing variable package tests: no NEW failure after the fix.
+        grep -E '^--- FAIL:' pkg_baseline.log | sed -E 's/^--- FAIL: ([^ ]+).*/\1/' | sort -u > pkg_baseline_failed.txt || true
+        grep -E '^--- FAIL:' pkg_patched.log  | sed -E 's/^--- FAIL: ([^ ]+).*/\1/' | sort -u > pkg_patched_failed.txt || true
+        echo "pkg baseline failed: $(tr '\n' ' ' < pkg_baseline_failed.txt)"
+        echo "pkg patched failed:  $(tr '\n' ' ' < pkg_patched_failed.txt)"
+        while read -r t; do
+          [ -z "$t" ] && continue
+          if ! grep -qx "$t" pkg_baseline_failed.txt; then
+            echo "::error::new variable-package test failure after fix: '$t'"; ok=0
+          fi
+        done < pkg_patched_failed.txt
+        if grep -q "^FAIL" pkg_patched.log && ! grep -q "^ok " pkg_patched.log; then
+          echo "::warning::variable package reported FAIL (see subset comparison above)."
+        fi
+        {
+          echo "# tidb#73702 runtime verification"
+          echo "- pingcap/tidb master commit: $(cat ${GITHUB_WORKSPACE}/tidb-sha.txt)"
+          echo "- race reproducer: before=${rb}, after=${ra}"
+          echo "- real server UNION smoke: before=$(grep -oE 'SERVER_(ALIVE|DEAD)' smoke_before.verdict.log | head -1), after=$(grep -oE 'SERVER_(ALIVE|DEAD)' smoke_after.verdict.log | head -1)"
+          echo "- variable package (existing tests): $(grep -E '^(ok|FAIL|---)' pkg_patched.log | head -1)"
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "${ok}" = "1" ]; then
+          echo "PASS: #73702 reproduced before fix and gone after; variable package no-regression." | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+          echo "FAIL: verification assertions failed." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+
+    - name: Upload logs
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: verify-73702-logs
+        path: |
+          results/*.log
+          results/*.verdict
+          results/*.verdict.log
+          tidb-sha.txt
+        retention-days: 30
